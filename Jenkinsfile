@@ -33,8 +33,6 @@ def get_stages(product, profile, docker_image, config_url, conan_develop_repo, c
           withEnv(["CONAN_USER_HOME=${env.WORKSPACE}/conan_home"]) {
             try {
               stage("Configure conan") {
-                sh "printenv"
-                sh 'rm -rf "${CONAN_USER_HOME}"'
                 sh "conan --version"
                 sh "conan config install ${config_url}"
                 sh "conan remote add ${conan_develop_repo} http://${artifactory_url}:8081/artifactory/api/conan/${conan_develop_repo}" // the namme of the repo is the same that the arttifactory key
@@ -51,7 +49,6 @@ def get_stages(product, profile, docker_image, config_url, conan_develop_repo, c
               stage("Insert the new revision ${params.reference} in ${product} graph") {
                 // this is a workaround, because installing with a specific reference does not create a lockfile
                 // and also, we need the information of the build nodes
-                sh "conan graph lock ${product}  --profile ${profile} --lockfile=${lockfile} -r ${conan_develop_repo}"
                 // develop should be consistent without missing packages
                 sh "conan install ${product} --profile ${profile} -r ${conan_develop_repo}"
                 // now install the newly created revision of the library with -- update
@@ -62,8 +59,8 @@ def get_stages(product, profile, docker_image, config_url, conan_develop_repo, c
                 sh "conan install ${product} --profile ${profile} --lockfile=${lockfile} --build missing "
                 sh "cat ${lockfile}"
               }
-              stage("Start build info: ${params.build_name} ${params.build_number}") { 
-                sh "conan_build_info --v2 start ${params.build_name} ${params.build_number}"
+              stage("Start build info: ${env.JOB_NAME} ${env.BUILD_NUMBER}") { 
+                sh "conan_build_info --v2 start ${env.JOB_NAME} ${env.BUILD_NUMBER}"
               }
               stage("Upload") {
                 // we upload to tmp, and later if everything is OK will promote to develop
@@ -113,36 +110,42 @@ pipeline {
           String docker_image = profiles.get(profile)
           docker.image(docker_image).inside("--net=host") {
             withEnv(["CONAN_USER_HOME=${env.WORKSPACE}/conan_cache"]) {
-              sh "conan config install ${config_url}"
-              sh "conan remote add ${conan_develop_repo} http://${artifactory_url}:8081/artifactory/api/conan/${conan_develop_repo}" // the namme of the repo is the same that the arttifactory key
-              withCredentials([usernamePassword(credentialsId: 'artifactory-credentials', usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
-                sh "conan user -p ${ARTIFACTORY_PASSWORD} -r ${conan_develop_repo} ${ARTIFACTORY_USER}"
-              }
-              products.each { product ->
-                println "name: ${product.key} repo: ${product.value}"
-                def lockfile = "${product.key}.lock"
-                def bo_file = "${product.key}.json"
-                sh "conan graph lock ${product.key} --profile ${profile} --lockfile=${lockfile} -r ${conan_develop_repo}"
-                sh "conan graph build-order ${lockfile} --json=${bo_file} --build"
-                String reference_name = "${params.reference.split("#")[0]}"
-                build_order = readJSON file: bo_file
-                // nested list
-                build_order.each { libs ->
-                  libs.each { lib ->
-                    String require = "${lib[1]}"
-                    println "checking if ${require} has ${reference_name} --> affects product ${product.key}"
-                    if (require.contains("${reference_name}")) {
-                      affected_products.add(product.key)
-                      println "added ${product.key} to affected products"
+              try {
+                sh "printenv"
+                sh "conan config install ${config_url}"
+                sh "conan remote add ${conan_develop_repo} http://${artifactory_url}:8081/artifactory/api/conan/${conan_develop_repo}" // the namme of the repo is the same that the arttifactory key
+                withCredentials([usernamePassword(credentialsId: 'artifactory-credentials', usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
+                  sh "conan user -p ${ARTIFACTORY_PASSWORD} -r ${conan_develop_repo} ${ARTIFACTORY_USER}"
+                }
+                products.each { product ->
+                  println "name: ${product.key} repo: ${product.value}"
+                  def lockfile = "${product.key}.lock"
+                  def bo_file = "${product.key}.json"
+                  sh "conan graph lock ${product.key} --profile ${profile} --lockfile=${lockfile} -r ${conan_develop_repo}"
+                  sh "conan graph build-order ${lockfile} --json=${bo_file} --build"
+                  String reference_name = "${params.reference.split("#")[0]}"
+                  build_order = readJSON file: bo_file
+                  // nested list
+                  build_order.each { libs ->
+                    libs.each { lib ->
+                      String require = "${lib[1]}"
+                      println "checking if ${require} has ${reference_name} --> affects product ${product.key}"
+                      if (require.contains("${reference_name}")) {
+                        affected_products.add(product.key)
+                        println "added ${product.key} to affected products"
+                      }
                     }
                   }
                 }
+                println "Affected products:"
+                affected_products.each { prod ->
+                  println("${prod}")
+                }
+                println "will be built"
               }
-              println "Affected products:"
-              affected_products.each { prod ->
-                println("${prod}")
-              }
-              println "will be built"
+              finally {
+                deleteDir()
+              }   
             }
           }
         }
@@ -158,6 +161,7 @@ pipeline {
               echo "Building product '${product}'"
               echo " - for changes in '${params.reference}'"
               echo " - called from: ${params.build_name}, build number: ${params.build_number}"
+              echo " - current build name: ${env.JOB_NAME}, build number: ${env.BUILD_NUMBER}"
               echo " - commit: ${params.commit_number} from branch: ${params.library_branch}"              
               build_result = parallel profiles.collectEntries { profile, docker_image ->
                 ["${profile}": get_stages(product, profile, docker_image, config_url, conan_develop_repo, conan_tmp_repo, params.library_branch, artifactory_url)]
@@ -174,27 +178,39 @@ pipeline {
       steps {
         script {
           docker.image("conanio/gcc8").inside("--net=host") {
-            def last_info = ""
-            products_build_result.each { product, result ->
-              result.each { profile, buildInfo ->
-                writeJSON file: "${profile}.json", json: buildInfo
-                if (last_info != "") {
-                  sh "conan_build_info --v2 update ${last_info} ${profile}.json --output-file mergedbuildinfo.json"
-                }
-                last_info = last_info=="" ? "${profile}.json" : "mergedbuildinfo.json"
-              }
-            }
-            println "Merged Build Info for all the products"
-            sh "cat mergedbuildinfo.json"
-            withCredentials([usernamePassword(credentialsId: 'artifactory-credentials', usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
-              sh "conan_build_info --v2 publish --url http://${artifactory_url}:8081/artifactory --user \"\${ARTIFACTORY_USER}\" --password \"\${ARTIFACTORY_PASSWORD}\" mergedbuildinfo.json"
-            }
-            // promote with the build info
+            // promote libraries to develop
             if (library_branch == "develop") {       
-              withCredentials([usernamePassword(credentialsId: 'artifactory-credentials', usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
-                sh "curl -u\"\${ARTIFACTORY_USER}\":\"\${ARTIFACTORY_PASSWORD}\" -XPOST \"http://${artifactory_url}:8081/artifactory/api/build/promote/${params.build_name}/${params.build_number}\" -H \"Content-type: application/json\" -d '{\"dryRun\" : false, \"sourceRepo\" : \"conan-tmp\", \"targetRepo\" : \"conan-develop\", \"copy\": true, \"artifacts\" : true, \"dependencies\" : true}'"
+              withEnv(["CONAN_USER_HOME=${env.WORKSPACE}/conan_cache"]) {
+                try {
+                  def last_info = ""
+                  products_build_result.each { product, result ->
+                    result.each { profile, buildInfo ->
+                      writeJSON file: "${profile}.json", json: buildInfo
+                      if (last_info != "") {
+                        sh "conan_build_info --v2 update ${last_info} ${profile}.json --output-file mergedbuildinfo.json"
+                      }
+                      last_info = last_info=="" ? "${profile}.json" : "mergedbuildinfo.json"
+                    }
+                  }
+                  println "Merged Build Info for all the products"
+                  sh "cat mergedbuildinfo.json"
+                  withCredentials([usernamePassword(credentialsId: 'artifactory-credentials', usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
+                    sh "conan_build_info --v2 publish --url http://${artifactory_url}:8081/artifactory --user \"\${ARTIFACTORY_USER}\" --password \"\${ARTIFACTORY_PASSWORD}\" mergedbuildinfo.json"
+                  }
+                  // promote with the build info from the library
+                  // withCredentials([usernamePassword(credentialsId: 'artifactory-credentials', usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
+                  //   sh "curl -u\"\${ARTIFACTORY_USER}\":\"\${ARTIFACTORY_PASSWORD}\" -XPOST \"http://${artifactory_url}:8081/artifactory/api/build/promote/${params.build_name}/${params.build_number}\" -H \"Content-type: application/json\" -d '{\"dryRun\" : false, \"sourceRepo\" : \"conan-tmp\", \"targetRepo\" : \"conan-develop\", \"copy\": false, \"artifacts\" : true, \"dependencies\" : false}'"
+                  // }
+                  // promote with the build info from this pipeline
+                  withCredentials([usernamePassword(credentialsId: 'artifactory-credentials', usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
+                    sh "curl -u\"\${ARTIFACTORY_USER}\":\"\${ARTIFACTORY_PASSWORD}\" -XPOST \"http://${artifactory_url}:8081/artifactory/api/build/promote/${env.JOB_NAME}/${env.BUILD_NUMBER}\" -H \"Content-type: application/json\" -d '{\"dryRun\" : false, \"sourceRepo\" : \"conan-tmp\", \"targetRepo\" : \"conan-develop\", \"copy\": false, \"artifacts\" : true, \"dependencies\" : true}'"
+                  }
+                }
+                finally {
+                  deleteDir()
+                }                    
               }
-            }        
+            }
           }
         }
       }
