@@ -139,7 +139,7 @@ pipeline {
               }
               finally {
                   deleteDir()
-              }              
+              }
             }
           }
         }
@@ -193,13 +193,12 @@ pipeline {
                 }
                 finally {
                   deleteDir()
-                }                         
-
-              }              
-            }        
+                }
+              }
+            }
           }
         }
       }
-    }      
+    }
   }
 }
